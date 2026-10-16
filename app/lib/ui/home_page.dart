@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -103,15 +104,55 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// Public Download/YTGet folder. Needs MANAGE_EXTERNAL_STORAGE
+  /// ("Allow all files") on Android 11+. Falls back to the app-private
+  /// dir if access isn't granted.
   Future<Directory> _outDir() async {
-    final dl = await getDownloadsDirectory();
+    if (await _ensureStorageAccess()) {
+      final dir = Directory('/storage/emulated/0/Download/YTGet');
+      await dir.create(recursive: true);
+      await _migrateLegacyFiles(dir);
+      return dir;
+    }
     final base =
-        dl ??
         await getExternalStorageDirectory() ??
         await getApplicationDocumentsDirectory();
     final dir = Directory('${base.path}/YTGet');
     await dir.create(recursive: true);
     return dir;
+  }
+
+  Future<bool> _ensureStorageAccess() async {
+    if (await Permission.manageExternalStorage.isGranted) return true;
+    final res = await Permission.manageExternalStorage.request();
+    if (res.isGranted) return true;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Allow "All files access" for the public Downloads folder, '
+            'or files stay app-private.',
+          ),
+        ),
+      );
+    }
+    return false;
+  }
+
+  /// Moves files downloaded before the public-folder switch into Download/YTGet.
+  Future<void> _migrateLegacyFiles(Directory target) async {
+    try {
+      final ext = await getExternalStorageDirectory();
+      if (ext == null) return;
+      final legacy = Directory('${ext.path}/YTGet');
+      if (!await legacy.exists()) return;
+      await for (final e in legacy.list()) {
+        if (e is File) {
+          final dest = File('${target.path}/${e.uri.pathSegments.last}');
+          if (!await dest.exists()) await e.rename(dest.path);
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _download() async {
