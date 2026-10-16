@@ -51,7 +51,9 @@ adb install app-arm64-v8a-release.apk
 1. Copy a YouTube link — or tap **Share → YTGet** inside the YouTube app.
 2. Hit **Preview** to confirm it's the right video.
 3. Pick the **MP3 / MP4** tab and a quality.
-4. Hit **Download**. Files land in `Download/YTGet/`.
+4. Hit **Download**. On first download, grant **"Allow all files"** when
+   asked — files land in the public `Download/YTGet/` folder, visible in
+   any file manager. Older downloads are moved there automatically.
 5. Open or share them anytime from **History**.
 
 ## 🛠️ Build from source
