@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'ui/home_page.dart';
+
 void main() => runApp(const YTGetApp());
 
 class YTGetApp extends StatelessWidget {
@@ -9,7 +11,7 @@ class YTGetApp extends StatelessWidget {
     return MaterialApp(
       title: 'YTGet',
       theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
-      home: const Scaffold(body: Center(child: Text('YTGet'))),
+      home: const HomePage(),
     );
   }
 }
