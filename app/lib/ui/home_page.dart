@@ -1,8 +1,16 @@
+import 'dart:io';
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:share_plus/share_plus.dart';
 
+import '../core/binary_manager.dart';
+import '../core/download_args.dart';
+import '../core/history_store.dart';
 import '../core/youtube_url.dart';
 import '../core/ytdlp_service.dart';
 
@@ -16,7 +24,9 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _urlCtrl = TextEditingController();
+  final _history = HistoryStore();
   bool _fetching = false;
+  bool _downloading = false;
   String? _error;
   VideoMeta? _meta;
   OutFormat _format = OutFormat.mp3;
@@ -24,10 +34,12 @@ class _HomePageState extends State<HomePage> {
   int _mp4H = 720;
   double? _progress;
   final List<String> _log = [];
+  List<Map<String, dynamic>> _entries = [];
 
   @override
   void initState() {
     super.initState();
+    _reloadHistory();
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (files.isNotEmpty) {
         _urlCtrl.text = files.first.path;
@@ -48,6 +60,11 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  Future<void> _reloadHistory() async {
+    _entries = await _history.list();
+    if (mounted) setState(() {});
+  }
+
   Future<void> _paste() async {
     final d = await Clipboard.getData(Clipboard.kTextPlain);
     if (d?.text != null) setState(() => _urlCtrl.text = d!.text!.trim());
@@ -65,22 +82,92 @@ class _HomePageState extends State<HomePage> {
       _meta = null;
     });
     try {
-      // Binary wiring lands in Task 5; for now surface a clear message
-      // if no yt-dlp binary path is configured.
-      throw Exception(
-        'Preview fetch needs the yt-dlp binary (Task 5). URL looks valid.',
-      );
+      final bin = await BinaryManager.ensureExecutable();
+      final meta = await YtDlp(bin).fetchInfo(raw);
+      setState(() => _meta = meta);
     } catch (e) {
-      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      setState(
+        () => _error = e.toString().replaceFirst('Exception: ', '').split('\n').first,
+      );
     } finally {
       setState(() => _fetching = false);
+    }
+  }
+
+  Future<Directory> _outDir() async {
+    final dl = await getDownloadsDirectory();
+    final base = dl ?? await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+    final dir = Directory('${base.path}/YTGet');
+    await dir.create(recursive: true);
+    return dir;
+  }
+
+  Future<void> _download() async {
+    final raw = _urlCtrl.text.trim();
+    if (_meta == null) return;
+    setState(() {
+      _downloading = true;
+      _progress = 0;
+      _log.clear();
+      _error = null;
+    });
+    try {
+      final bin = await BinaryManager.ensureExecutable();
+      final dir = await _outDir();
+      final safeTitle = _meta!.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      final ext = _format == OutFormat.mp3 ? 'mp3' : 'mp4';
+      final outTpl = '${dir.path}/$safeTitle.%(ext)s';
+      final args = _format == OutFormat.mp3
+          ? buildMp3Args(raw, _mp3Kbps, outTpl)
+          : buildMp4Args(raw, _mp4H, outTpl);
+      await for (final p in YtDlp(bin).download(
+        args,
+        onLog: (l) => setState(() {
+          _log.add(l);
+          if (_log.length > 200) _log.removeAt(0);
+        }),
+      )) {
+        setState(() => _progress = p);
+      }
+      final file = File('${dir.path}/$safeTitle.$ext');
+      await _history.add({
+        'title': _meta!.title,
+        'path': file.path,
+        'format': ext,
+        'url': raw,
+      });
+      await _reloadHistory();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Saved to ${file.path}')));
+      }
+    } catch (e) {
+      setState(
+        () => _error = e.toString().replaceFirst('Exception: ', '').split('\n').first,
+      );
+    } finally {
+      setState(() {
+        _downloading = false;
+        _progress = null;
+      });
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('YTGet')),
+      appBar: AppBar(
+        title: const Text('YTGet'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const _SettingsPage()),
+            ),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -119,15 +206,38 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
           FilledButton.icon(
-            onPressed: _meta == null ? null : () {},
+            onPressed: (_meta == null || _downloading) ? null : _download,
             icon: const Icon(Icons.download),
-            label: const Text('Download (Task 5)'),
+            label: Text(_downloading ? 'Downloading…' : 'Download'),
           ),
           if (_log.isNotEmpty)
             ExpansionTile(
               title: const Text('Log'),
-              children: _log.map((l) => Text(l)).toList(),
+              children: _log.reversed.take(30).map((l) => Text(l)).toList(),
             ),
+          const Divider(),
+          const Text('History'),
+          ..._entries.map(
+            (e) => ListTile(
+              title: Text((e['title'] ?? '').toString()),
+              subtitle: Text((e['path'] ?? '').toString()),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.open_in_new),
+                    onPressed: () => OpenFilex.open((e['path'] ?? '').toString()),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.share),
+                    onPressed: () => Share.shareXFiles([
+                      XFile((e['path'] ?? '').toString()),
+                    ]),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -186,6 +296,42 @@ class _HomePageState extends State<HomePage> {
             onChanged: (v) => setState(() => _mp4H = v ?? 720),
           ),
       ],
+    );
+  }
+}
+
+class _SettingsPage extends StatefulWidget {
+  const _SettingsPage();
+  @override
+  State<_SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<_SettingsPage> {
+  String _ver = '…';
+  @override
+  void initState() {
+    super.initState();
+    BinaryManager.ensureExecutable()
+        .then((b) => BinaryManager.version(b))
+        .then((v) => setState(() => _ver = v))
+        .catchError((e) => setState(() => _ver = 'missing — run tool/fetch_ytdlp.sh'));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          ListTile(title: const Text('yt-dlp version'), subtitle: Text(_ver)),
+          const Text(
+            'Personal use only. Only download your own videos, Creative Commons, '
+            'or content you have permission for. YouTube ToS applies. '
+            'Sideload only — never for the Play Store.',
+          ),
+        ],
+      ),
     );
   }
 }
