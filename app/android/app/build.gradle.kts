@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.ytget.ytget"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -27,6 +27,10 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // NOTE: no ndk abiFilters — `flutter build apk --split-per-abi`
+        // sets splits.abi filters, which conflict with abiFilters.
+        // Splits already package per-ABI .so files (incl. youtubedl-android
+        // python/ffmpeg libs) correctly.
     }
 
     buildTypes {
@@ -34,6 +38,12 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 }
@@ -46,4 +56,9 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
 }

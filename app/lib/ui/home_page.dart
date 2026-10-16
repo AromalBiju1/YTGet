@@ -8,9 +8,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:share_plus/share_plus.dart';
 
-import '../core/binary_manager.dart';
 import '../core/download_args.dart';
 import '../core/history_store.dart';
+import '../core/native_ytdlp.dart';
 import '../core/youtube_url.dart';
 import '../core/ytdlp_service.dart';
 
@@ -25,14 +25,17 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _urlCtrl = TextEditingController();
   final _history = HistoryStore();
+  final _native = NativeYtDlp();
   bool _fetching = false;
   bool _downloading = false;
+  bool _engineReady = false;
   String? _error;
   VideoMeta? _meta;
   OutFormat _format = OutFormat.mp3;
   int _mp3Kbps = 192;
   int _mp4H = 720;
   double? _progress;
+  String? _processId;
   final List<String> _log = [];
   List<Map<String, dynamic>> _entries = [];
 
@@ -40,6 +43,13 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _reloadHistory();
+    _native.init().then((_) {
+      if (mounted) setState(() => _engineReady = true);
+    }).catchError((Object e) {
+      if (mounted) {
+        setState(() => _error = 'Engine init failed: $e');
+      }
+    });
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (files.isNotEmpty) {
         _urlCtrl.text = files.first.path;
@@ -82,13 +92,12 @@ class _HomePageState extends State<HomePage> {
       _meta = null;
     });
     try {
-      final bin = await BinaryManager.ensureExecutable();
-      final meta = await YtDlp(bin).fetchInfo(raw);
+      final meta = await _native.getInfo(raw);
       setState(() => _meta = meta);
+    } on PlatformException catch (e) {
+      setState(() => _error = (e.message ?? e.code).split('\n').first);
     } catch (e) {
-      setState(
-        () => _error = e.toString().replaceFirst('Exception: ', '').split('\n').first,
-      );
+      setState(() => _error = '$e'.split('\n').first);
     } finally {
       setState(() => _fetching = false);
     }
@@ -96,7 +105,10 @@ class _HomePageState extends State<HomePage> {
 
   Future<Directory> _outDir() async {
     final dl = await getDownloadsDirectory();
-    final base = dl ?? await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+    final base =
+        dl ??
+        await getExternalStorageDirectory() ??
+        await getApplicationDocumentsDirectory();
     final dir = Directory('${base.path}/YTGet');
     await dir.create(recursive: true);
     return dir;
@@ -110,22 +122,22 @@ class _HomePageState extends State<HomePage> {
       _progress = 0;
       _log.clear();
       _error = null;
+      _processId = DateTime.now().millisecondsSinceEpoch.toString();
     });
     try {
-      final bin = await BinaryManager.ensureExecutable();
       final dir = await _outDir();
       final safeTitle = _meta!.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
       final ext = _format == OutFormat.mp3 ? 'mp3' : 'mp4';
       final outTpl = '${dir.path}/$safeTitle.%(ext)s';
-      final args = _format == OutFormat.mp3
+      final fullArgs = _format == OutFormat.mp3
           ? buildMp3Args(raw, _mp3Kbps, outTpl)
           : buildMp4Args(raw, _mp4H, outTpl);
-      await for (final p in YtDlp(bin).download(
-        args,
-        onLog: (l) => setState(() {
-          _log.add(l);
-          if (_log.length > 200) _log.removeAt(0);
-        }),
+      // Last element is the URL (passed separately to the native request).
+      final options = fullArgs.sublist(0, fullArgs.length - 1);
+      await for (final p in _native.download(
+        processId: _processId!,
+        url: raw,
+        options: options,
       )) {
         setState(() => _progress = p);
       }
@@ -143,14 +155,19 @@ class _HomePageState extends State<HomePage> {
         ).showSnackBar(SnackBar(content: Text('Saved to ${file.path}')));
       }
     } catch (e) {
-      setState(
-        () => _error = e.toString().replaceFirst('Exception: ', '').split('\n').first,
-      );
+      setState(() => _error = '$e'.split('\n').first);
     } finally {
       setState(() {
         _downloading = false;
         _progress = null;
+        _processId = null;
       });
+    }
+  }
+
+  Future<void> _cancel() async {
+    if (_processId != null) {
+      await _native.cancel(_processId!);
     }
   }
 
@@ -160,6 +177,15 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('YTGet'),
         actions: [
+          if (!_engineReady)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(
@@ -186,7 +212,7 @@ class _HomePageState extends State<HomePage> {
           ),
           const SizedBox(height: 12),
           FilledButton.icon(
-            onPressed: _fetching ? null : _fetch,
+            onPressed: (_fetching || !_engineReady) ? null : _fetch,
             icon: const Icon(Icons.search),
             label: Text(_fetching ? 'Fetching…' : 'Preview'),
           ),
@@ -205,10 +231,26 @@ class _HomePageState extends State<HomePage> {
                 Text('${((_progress ?? 0) * 100).toStringAsFixed(1)}%'),
               ],
             ),
-          FilledButton.icon(
-            onPressed: (_meta == null || _downloading) ? null : _download,
-            icon: const Icon(Icons.download),
-            label: Text(_downloading ? 'Downloading…' : 'Download'),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: (_meta == null || _downloading || !_engineReady)
+                      ? null
+                      : _download,
+                  icon: const Icon(Icons.download),
+                  label: Text(_downloading ? 'Downloading…' : 'Download'),
+                ),
+              ),
+              if (_downloading) ...[
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _cancel,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Cancel'),
+                ),
+              ],
+            ],
           ),
           if (_log.isNotEmpty)
             ExpansionTile(
@@ -226,7 +268,8 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   IconButton(
                     icon: const Icon(Icons.open_in_new),
-                    onPressed: () => OpenFilex.open((e['path'] ?? '').toString()),
+                    onPressed: () =>
+                        OpenFilex.open((e['path'] ?? '').toString()),
                   ),
                   IconButton(
                     icon: const Icon(Icons.share),
@@ -307,14 +350,39 @@ class _SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<_SettingsPage> {
+  final _native = NativeYtDlp();
   String _ver = '…';
+  bool _updating = false;
+
   @override
   void initState() {
     super.initState();
-    BinaryManager.ensureExecutable()
-        .then((b) => BinaryManager.version(b))
-        .then((v) => setState(() => _ver = v))
-        .catchError((e) => setState(() => _ver = 'missing — run tool/fetch_ytdlp.sh'));
+    _native.version().then((v) {
+      if (mounted) setState(() => _ver = v);
+    }).catchError((Object e) {
+      if (mounted) setState(() => _ver = 'error: $e');
+    });
+  }
+
+  Future<void> _update() async {
+    setState(() => _updating = true);
+    try {
+      final s = await _native.update();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Update: $s')));
+        setState(() => _ver = 'updated ($s) — reopen to refresh');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Update failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _updating = false);
+    }
   }
 
   @override
@@ -324,7 +392,13 @@ class _SettingsPageState extends State<_SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          ListTile(title: const Text('yt-dlp version'), subtitle: Text(_ver)),
+          ListTile(
+            title: const Text('yt-dlp version'),
+            subtitle: Text(_ver),
+            trailing: _updating
+                ? const CircularProgressIndicator()
+                : TextButton(onPressed: _update, child: const Text('Update')),
+          ),
           const Text(
             'Personal use only. Only download your own videos, Creative Commons, '
             'or content you have permission for. YouTube ToS applies. '
