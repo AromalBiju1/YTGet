@@ -35,10 +35,15 @@ Creative Commons media, or content you have permission to save.
 - 🔗 **Paste a link or Share → YTGet** straight from the YouTube app
 - 🖼️ **Preview first** — title, thumbnail, duration before you download
 - 🎵 **MP3** at 128 / 192 / 320 kbps · 🎬 **MP4** at 720p / 1080p
-- 📊 Live progress with cancel, plus an on-screen yt-dlp log
+- 📊 Live progress with cancel — states flow **Downloading → Processing (merge) → Downloaded**
 - 📁 **Choose where files go** — public `Download/YTGet`, app storage, or any
   custom folder on the device
-- 🕘 Download history — open, share, or delete entries, or clear the whole list
+- 🕚 **Dedicated History tab** — open, share, or delete entries, or clear the
+  whole list; downloads finish even while you're browsing it
+- 🚫 **Duplicate guard** — warns before re-downloading the same video, with a
+  one-tap "Open file" shortcut
+- 🔔 **Runs in the background** — switch tabs, lock the phone; a notification
+  tells you when the file is ready
 - 🔄 In-app yt-dlp updater for when YouTube changes things
 - 🔒 **100% on-device.** No backend, no analytics, no ads, no accounts
 
@@ -70,14 +75,16 @@ adb install app-arm64-v8a-release.apk
    no permission), or **Custom folder…** (browse the device).
 5. Hit **Download**. To use the public Downloads folder or a custom location,
    grant **"Allow all files"** when asked.
-6. Manage files under **History** — open, share, delete an entry, or
-   **Clear** the entire list.
+6. Manage files in the **History** tab — open, share, delete single entries,
+   or **Clear all**.
 
 ## ⚠️ Limitations (read before reporting a bug)
 
 - **Android only, arm64 only.** No iOS, Windows, or armv7/x86_64 builds.
-- **Downloads die if the app is killed.** There is no background/foreground
-  service process — keep the app in the foreground while downloading.
+- **Downloads run without a foreground service.** They keep going while you
+  browse other tabs, lock the screen, or background the app — but swiping
+  YTGet away from Recents kills any ongoing download. Very long downloads on
+  locked devices may also be throttled (Doze).
 - **The bundled yt-dlp ages fast.** When YouTube changes its site, downloads
   break everywhere. Fix: **Settings → Update**; if that fails, wait for a new
   engine release upstream and rebuild.
@@ -133,8 +140,12 @@ app/lib/core/native_ytdlp.dart    MethodChannel/EventChannel client (runtime pat
 app/lib/core/ytdlp_service.dart   VideoMeta model + desktop process runner (reference)
 app/lib/core/binary_manager.dart  (superseded by the native lib, kept for reference)
 app/lib/core/save_location.dart   chosen save-folder (mode + custom path)
-app/lib/core/history_store.dart   download history (shared_prefs)
-app/lib/ui/home_page.dart         main UI: logo, folder picker, history, settings
+app/lib/core/history_store.dart   download history (shared_prefs) + live controller
+app/lib/core/app_notifier.dart    "download complete" notification helper
+app/lib/ui/app_shell.dart         navigation shell: Download / History tabs + app bar
+app/lib/ui/download_page.dart     download flow: link, preview, quality, folder, progress
+app/lib/ui/history_page.dart      dedicated history screen (clear/delete/open/share)
+app/lib/ui/settings_page.dart     yt-dlp version + update (text-only _SettingsPage)
 app/android/.../YtDlpBridge.kt    Kotlin bridge: init / info / download / cancel / update
 ```
 
