@@ -34,11 +34,11 @@ dependencies:
   permission_handler: ^11.3.1
   receive_sharing_intent: ^1.8.0
   open_filex: ^4.3.0
-  share_plus: ^10.1.2
+  share_plus: ^13.0.0
   cached_network_image: ^3.3.1
   path_provider: ^2.1.2
   shared_preferences: ^2.2.3
-
+  file_picker: ^12.2.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -65,6 +65,10 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # App logo (shown in the app bar; also used for the launcher icon).
+  assets:
+    - assets/logo.png
 
   # NOTE: yt-dlp binary bundling is pending (official releases ship no
   # Android asset). Re-add when the runtime strategy is decided:

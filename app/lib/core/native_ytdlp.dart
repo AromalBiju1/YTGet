@@ -23,10 +23,12 @@ class NativeYtDlp {
   }
 
   /// Emits 0.0–1.0 progress for [processId], completes on done, throws on error.
+  /// [onLog] receives raw yt-dlp output lines for the log view.
   Stream<double> download({
     required String processId,
     required String url,
     required List<String> options,
+    void Function(String line)? onLog,
   }) {
     final controller = StreamController<double>();
     late final StreamSubscription sub;
@@ -42,6 +44,8 @@ class NativeYtDlp {
           sub.cancel();
           controller.close();
         } else if (m.containsKey('progress')) {
+          final line = m['line'];
+          if (line != null && onLog != null) onLog(line.toString());
           controller.add(((m['progress'] as num).toDouble()).clamp(0.0, 1.0));
         }
       },

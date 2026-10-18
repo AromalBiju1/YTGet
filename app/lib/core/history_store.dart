@@ -18,8 +18,21 @@ class HistoryStore {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_key);
     if (raw == null) return [];
-    final decoded = jsonDecode(raw) as List;
-    return decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    try {
+      final decoded = jsonDecode(raw) as List;
+      return decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> removeWhere(
+    bool Function(Map<String, dynamic> e) test,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = await this.list();
+    final kept = list.where((e) => !test(e)).toList();
+    await prefs.setString(_key, jsonEncode(kept));
   }
 
   Future<void> clear() async {

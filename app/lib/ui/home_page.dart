@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
@@ -12,6 +14,7 @@ import 'package:share_plus/share_plus.dart';
 import '../core/download_args.dart';
 import '../core/history_store.dart';
 import '../core/native_ytdlp.dart';
+import '../core/save_location.dart';
 import '../core/youtube_url.dart';
 import '../core/ytdlp_service.dart';
 
@@ -29,6 +32,7 @@ class _HomePageState extends State<HomePage> {
   final _native = NativeYtDlp();
   bool _fetching = false;
   bool _downloading = false;
+  bool _cancelled = false;
   bool _engineReady = false;
   String? _error;
   VideoMeta? _meta;
@@ -37,6 +41,8 @@ class _HomePageState extends State<HomePage> {
   int _mp4H = 720;
   double? _progress;
   String? _processId;
+  SaveMode _saveMode = SaveMode.publicDownloads;
+  String? _customSavePath;
   final List<String> _log = [];
   List<Map<String, dynamic>> _entries = [];
 
@@ -44,25 +50,27 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _reloadHistory();
+    _loadSaveSettings();
     _native.init().then((_) {
       if (mounted) setState(() => _engineReady = true);
     }).catchError((Object e) {
-      if (mounted) {
-        setState(() => _error = 'Engine init failed: $e');
-      }
+      if (mounted) setState(() => _error = 'Engine init failed: $e');
     });
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (files.isNotEmpty) {
         _urlCtrl.text = files.first.path;
         _fetch();
       }
-    });
-    ReceiveSharingIntent.instance.getMediaStream().listen((files) {
-      if (files.isNotEmpty && mounted) {
-        setState(() => _urlCtrl.text = files.first.path);
-        _fetch();
-      }
-    });
+    }).catchError((Object _) {});
+    ReceiveSharingIntent.instance.getMediaStream().listen(
+      (files) {
+        if (files.isNotEmpty && mounted) {
+          setState(() => _urlCtrl.text = files.first.path);
+          _fetch();
+        }
+      },
+      onError: (Object _) {},
+    );
   }
 
   @override
@@ -71,9 +79,35 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   Future<void> _reloadHistory() async {
     _entries = await _history.list();
     if (mounted) setState(() {});
+  }
+
+  Future<void> _loadSaveSettings() async {
+    final mode = await SaveLocation.load();
+    final path = await SaveLocation.loadCustomPath();
+    if (!mounted) return;
+    setState(() {
+      _saveMode = mode;
+      _customSavePath = path;
+    });
+  }
+
+  String get _saveFolderSubtitle {
+    switch (_saveMode) {
+      case SaveMode.publicDownloads:
+        return 'Downloads/YTGet (public)';
+      case SaveMode.appPrivate:
+        return 'App storage/YTGet (private)';
+      case SaveMode.custom:
+        return _customSavePath ?? 'Choose a folder…';
+    }
   }
 
   Future<void> _paste() async {
@@ -93,8 +127,15 @@ class _HomePageState extends State<HomePage> {
       _meta = null;
     });
     try {
-      final meta = await _native.getInfo(raw);
+      final meta = await _native
+          .getInfo(raw)
+          .timeout(const Duration(seconds: 45));
       setState(() => _meta = meta);
+    } on TimeoutException {
+      setState(
+        () => _error =
+            'Fetching timed out — check your connection and try again.',
+      );
     } on PlatformException catch (e) {
       setState(() => _error = (e.message ?? e.code).split('\n').first);
     } catch (e) {
@@ -104,16 +145,38 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Public Download/YTGet folder. Needs MANAGE_EXTERNAL_STORAGE
-  /// ("Allow all files") on Android 11+. Falls back to the app-private
-  /// dir if access isn't granted.
+  /// Resolve the target output directory for the user's chosen save mode.
+  /// Public folder needs MANAGE_EXTERNAL_STORAGE ("Allow all files");
+  /// everything else falls back to the app-private dir if access isn't
+  /// granted or the custom path can't be used.
   Future<Directory> _outDir() async {
-    if (await _ensureStorageAccess()) {
-      final dir = Directory('/storage/emulated/0/Download/YTGet');
-      await dir.create(recursive: true);
-      await _migrateLegacyFiles(dir);
-      return dir;
+    switch (_saveMode) {
+      case SaveMode.appPrivate:
+        return _appPrivateOutDir();
+      case SaveMode.custom:
+        final p = _customSavePath;
+        if (p != null) {
+          try {
+            final dir = Directory(p);
+            await dir.create(recursive: true);
+            return dir;
+          } catch (_) {
+            _snack('Custom folder unavailable — using app storage.');
+          }
+        }
+        return _appPrivateOutDir();
+      case SaveMode.publicDownloads:
+        if (await _ensureStorageAccess()) {
+          final dir = Directory('/storage/emulated/0/Download/YTGet');
+          await dir.create(recursive: true);
+          await _migrateLegacyFiles(dir);
+          return dir;
+        }
+        return _appPrivateOutDir();
     }
+  }
+
+  Future<Directory> _appPrivateOutDir() async {
     final base =
         await getExternalStorageDirectory() ??
         await getApplicationDocumentsDirectory();
@@ -126,17 +189,79 @@ class _HomePageState extends State<HomePage> {
     if (await Permission.manageExternalStorage.isGranted) return true;
     final res = await Permission.manageExternalStorage.request();
     if (res.isGranted) return true;
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Allow "All files access" for the public Downloads folder, '
-            'or files stay app-private.',
+    _snack(
+      'Allow "All files access" for folders outside app storage, '
+      'or files stay app-private.',
+    );
+    return false;
+  }
+
+  Future<void> _showSaveSheet() async {
+    final res = await showModalBottomSheet<SaveMode?>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetCtx) => SafeArea(
+        child: RadioGroup<SaveMode>(
+          groupValue: _saveMode,
+          onChanged: (v) => Navigator.pop(sheetCtx, v),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              RadioListTile<SaveMode>(
+                title: const Text('Downloads/YTGet'),
+                subtitle: const Text(
+                  'Public folder — visible in any file manager. Recommended.',
+                ),
+                value: SaveMode.publicDownloads,
+              ),
+              RadioListTile<SaveMode>(
+                title: const Text('App storage'),
+                subtitle: const Text(
+                  'App-private — no "all files" permission needed.',
+                ),
+                value: SaveMode.appPrivate,
+              ),
+              ListTile(
+                onTap: () async {
+                  final p = await _pickCustomFolder();
+                  if (p != null && sheetCtx.mounted) {
+                    Navigator.pop(sheetCtx, SaveMode.custom);
+                  }
+                },
+                title: const Text('Custom folder…'),
+                subtitle: Text(
+                  _customSavePath ?? 'Browse your device for a folder',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                trailing: const Icon(Icons.folder_open, size: 20),
+              ),
+            ],
           ),
         ),
-      );
+      ),
+    );
+    if (res == null) return;
+    if (res == SaveMode.custom && _customSavePath == null) return;
+    await SaveLocation.save(res);
+    if (!mounted) return;
+    setState(() => _saveMode = res);
+    _snack('Files will be saved to: $_saveFolderSubtitle');
+  }
+
+  Future<String?> _pickCustomFolder() async {
+    if (!await _ensureStorageAccess()) return null;
+    final p = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Choose a folder',
+    );
+    if (p == null) return null;
+    if (p == '/' || !p.startsWith('/')) {
+      _snack('That location is not usable — pick a folder on device storage.');
+      return null;
     }
-    return false;
+    await SaveLocation.saveCustomPath(p);
+    if (mounted) setState(() => _customSavePath = p);
+    return p;
   }
 
   /// Moves files downloaded before the public-folder switch into Download/YTGet.
@@ -155,11 +280,33 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
+  /// yt-dlp output titles come from YouTube metadata — cap the length
+  /// and strip separators/characters that break filenames.
+  String _safeTitle(String title) {
+    var t = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    t = t.replaceAll(RegExp(r'[\x00-\x1F]'), ' ');
+    t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (t.length > 120) t = t.substring(0, 120).trim();
+    if (t.startsWith('.')) t = '_${t.substring(1)}';
+    if (t.isEmpty) t = 'ytget-download';
+    return t;
+  }
+
+  String _durFmt(int s) {
+    if (s <= 0) return '—';
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    final sec = s % 60;
+    String two(int v) => v.toString().padLeft(2, '0');
+    return h > 0 ? '$h:${two(m)}:${two(sec)}' : '$m:${two(sec)}';
+  }
+
   Future<void> _download() async {
     final raw = _urlCtrl.text.trim();
     if (_meta == null) return;
     setState(() {
       _downloading = true;
+      _cancelled = false;
       _progress = 0;
       _log.clear();
       _error = null;
@@ -167,7 +314,7 @@ class _HomePageState extends State<HomePage> {
     });
     try {
       final dir = await _outDir();
-      final safeTitle = _meta!.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      final safeTitle = _safeTitle(_meta!.title);
       final ext = _format == OutFormat.mp3 ? 'mp3' : 'mp4';
       final outTpl = '${dir.path}/$safeTitle.%(ext)s';
       final fullArgs = _format == OutFormat.mp3
@@ -179,6 +326,7 @@ class _HomePageState extends State<HomePage> {
         processId: _processId!,
         url: raw,
         options: options,
+        onLog: (String line) => _log.add(line),
       )) {
         setState(() => _progress = p);
       }
@@ -190,13 +338,11 @@ class _HomePageState extends State<HomePage> {
         'url': raw,
       });
       await _reloadHistory();
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Saved to ${file.path}')));
-      }
+      _snack('Saved to ${file.path}');
     } catch (e) {
-      setState(() => _error = '$e'.split('\n').first);
+      if (!_cancelled) {
+        setState(() => _error = '$e'.split('\n').first);
+      }
     } finally {
       setState(() {
         _downloading = false;
@@ -207,16 +353,66 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _cancel() async {
+    setState(() => _cancelled = true);
     if (_processId != null) {
       await _native.cancel(_processId!);
     }
+  }
+
+  Future<void> _clearHistory() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear download history?'),
+        content: const Text(
+          'This removes the list shown here. Downloaded files stay on disk — '
+          'delete them from your file manager if needed.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await _history.clear();
+    await _reloadHistory();
+    _snack('History cleared');
+  }
+
+  Future<void> _deleteEntry(Map<String, dynamic> e) async {
+    await _history.removeWhere((x) => x['path'] == e['path']);
+    await _reloadHistory();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('YTGet'),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.asset(
+                'assets/logo.png',
+                height: 26,
+                width: 26,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) =>
+                    const Icon(Icons.video_library, size: 22),
+              ),
+            ),
+            const SizedBox(width: 10),
+            const Text('YTGet'),
+          ],
+        ),
         actions: [
           if (!_engineReady)
             const Padding(
@@ -264,6 +460,22 @@ class _HomePageState extends State<HomePage> {
           if (_meta != null) _previewCard(),
           const SizedBox(height: 16),
           _formatPicker(),
+          const SizedBox(height: 8),
+          Card(
+            margin: EdgeInsets.zero,
+            child: ListTile(
+              dense: true,
+              leading: const Icon(Icons.folder_open),
+              title: const Text('Save to'),
+              subtitle: Text(
+                _saveFolderSubtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: const Icon(Icons.swap_horiz, size: 20),
+              onTap: _showSaveSheet,
+            ),
+          ),
           const SizedBox(height: 16),
           if (_progress != null)
             Column(
@@ -296,27 +508,68 @@ class _HomePageState extends State<HomePage> {
           if (_log.isNotEmpty)
             ExpansionTile(
               title: const Text('Log'),
-              children: _log.reversed.take(30).map((l) => Text(l)).toList(),
+              children: _log.reversed.take(30).map(
+                (l) => Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    l,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ).toList(),
             ),
           const Divider(),
-          const Text('History'),
+          Padding(
+            padding: const EdgeInsets.only(top: 2, bottom: 4),
+            child: Row(
+              children: [
+                const Text(
+                  'History',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                if (_entries.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: _clearHistory,
+                    icon: const Icon(Icons.delete_sweep, size: 18),
+                    label: const Text('Clear'),
+                  ),
+              ],
+            ),
+          ),
           ..._entries.map(
             (e) => ListTile(
               title: Text((e['title'] ?? '').toString()),
-              subtitle: Text((e['path'] ?? '').toString()),
+              subtitle: Text(
+                (e['path'] ?? '').toString(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   IconButton(
                     icon: const Icon(Icons.open_in_new),
+                    tooltip: 'Open',
                     onPressed: () =>
                         OpenFilex.open((e['path'] ?? '').toString()),
                   ),
                   IconButton(
                     icon: const Icon(Icons.share),
-                    onPressed: () => Share.shareXFiles([
-                      XFile((e['path'] ?? '').toString()),
-                    ]),
+                    tooltip: 'Share',
+                    onPressed: () => SharePlus.instance.share(
+                      ShareParams(
+                        files: [XFile((e['path'] ?? '').toString())],
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: 'Remove from history',
+                    onPressed: () => _deleteEntry(e),
                   ),
                 ],
               ),
@@ -333,14 +586,17 @@ class _HomePageState extends State<HomePage> {
       child: ListTile(
         leading: m.thumb.isEmpty
             ? const Icon(Icons.video_library)
-            : CachedNetworkImage(
-                imageUrl: m.thumb,
-                width: 72,
-                height: 48,
-                fit: BoxFit.cover,
+            : ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: CachedNetworkImage(
+                  imageUrl: m.thumb,
+                  width: 72,
+                  height: 48,
+                  fit: BoxFit.cover,
+                ),
               ),
         title: Text(m.title),
-        subtitle: Text('${m.author} • ${m.durSec}s'),
+        subtitle: Text('${m.author} • ${_durFmt(m.durSec)}'),
       ),
     );
   }
