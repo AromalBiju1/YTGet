@@ -391,7 +391,6 @@ class _DownloadPageState extends State<DownloadPage> {
         'url': raw,
       });
       await widget.notifier.downloadDone(_meta!.title);
-      _snack('Saved to ${file.path}');
       if (mounted) setState(() => _done = true);
     } catch (e) {
       if (!_cancelled) {
@@ -531,7 +530,7 @@ class _DownloadPageState extends State<DownloadPage> {
                     Icon(Icons.check_circle, size: 16, color: Colors.green),
                     const SizedBox(width: 4),
                     Text(
-                      'Downloaded',
+                      'Downloaded · 100%',
                       style: TextStyle(
                         color: Colors.green.shade700,
                         fontWeight: FontWeight.w600,

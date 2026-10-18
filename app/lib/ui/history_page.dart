@@ -69,11 +69,14 @@ class HistoryPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final entries = history.entries;
     final theme = Theme.of(context);
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 250),
-      child: entries.isEmpty
+    return ListenableBuilder(
+      listenable: history,
+      builder: (context, _) {
+        final entries = history.entries;
+        return AnimatedSwitcher(
+          duration: const Duration(milliseconds: 250),
+          child: entries.isEmpty
           ? _EmptyState(onBrowse: onBrowse, key: const ValueKey('empty'))
           : ListView.separated(
               key: const ValueKey('list'),
@@ -167,6 +170,8 @@ class HistoryPage extends StatelessWidget {
                 );
               },
             ),
+        );
+      },
     );
   }
 }
