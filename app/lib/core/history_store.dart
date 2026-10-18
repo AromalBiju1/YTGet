@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class HistoryStore {
@@ -38,5 +39,46 @@ class HistoryStore {
   Future<void> clear() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_key);
+  }
+}
+
+/// Live, shareable history state so both tabs see downloads the moment
+/// they finish. Wraps [HistoryStore] and broadcasts changes.
+class HistoryController extends ChangeNotifier {
+  HistoryController(this._store);
+
+  final HistoryStore _store;
+  List<Map<String, dynamic>> _entries = [];
+  bool _loaded = false;
+
+  List<Map<String, dynamic>> get entries => List.unmodifiable(_entries);
+  bool get loaded => _loaded;
+
+  Map<String, dynamic>? firstForUrl(String url) {
+    for (final e in _entries) {
+      if ((e['url'] ?? '').toString() == url) return e;
+    }
+    return null;
+  }
+
+  Future<void> refresh() async {
+    _entries = await _store.list();
+    _loaded = true;
+    notifyListeners();
+  }
+
+  Future<void> add(Map<String, dynamic> e) async {
+    await _store.add(e);
+    await refresh();
+  }
+
+  Future<void> removeWhere(bool Function(Map<String, dynamic> e) test) async {
+    await _store.removeWhere(test);
+    await refresh();
+  }
+
+  Future<void> clear() async {
+    await _store.clear();
+    await refresh();
   }
 }

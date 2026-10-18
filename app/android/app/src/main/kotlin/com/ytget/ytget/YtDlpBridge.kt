@@ -61,15 +61,8 @@ class YtDlpBridge(private val appContext: Context) :
                     try {
                         val request = YoutubeDLRequest(url)
                         applyOptions(request, options)
-                        YoutubeDL.getInstance().execute(request, processId) { progress, eta, line ->
-                            postEvent(
-                                mapOf(
-                                    "processId" to processId,
-                                    "progress" to progress,
-                                    "eta" to eta,
-                                    "line" to line
-                                )
-                            )
+                        YoutubeDL.getInstance().execute(request, processId) { progress, eta, _ ->
+                            postEvent(mapOf("processId" to processId, "progress" to progress, "eta" to eta))
                         }
                         postEvent(mapOf("processId" to processId, "done" to true))
                         mainHandler.post { result.success(true) }

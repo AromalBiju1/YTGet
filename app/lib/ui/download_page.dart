@@ -9,8 +9,8 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
-import 'package:share_plus/share_plus.dart';
 
+import '../core/app_notifier.dart';
 import '../core/download_args.dart';
 import '../core/history_store.dart';
 import '../core/native_ytdlp.dart';
@@ -20,20 +20,34 @@ import '../core/ytdlp_service.dart';
 
 enum OutFormat { mp3, mp4 }
 
-class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+class DownloadPage extends StatefulWidget {
+  const DownloadPage({
+    required this.native,
+    required this.history,
+    required this.engineReady,
+    required this.engineError,
+    required this.notifier,
+    required this.onSwitchToHistory,
+    super.key,
+  });
+
+  final NativeYtDlp native;
+  final HistoryController history;
+  final bool engineReady;
+  final String? engineError;
+  final AppNotifier notifier;
+  final VoidCallback onSwitchToHistory;
+
   @override
-  State<HomePage> createState() => _HomePageState();
+  State<DownloadPage> createState() => _DownloadPageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _DownloadPageState extends State<DownloadPage> {
   final _urlCtrl = TextEditingController();
-  final _history = HistoryStore();
-  final _native = NativeYtDlp();
   bool _fetching = false;
   bool _downloading = false;
   bool _cancelled = false;
-  bool _engineReady = false;
+  bool _done = false;
   String? _error;
   VideoMeta? _meta;
   OutFormat _format = OutFormat.mp3;
@@ -43,19 +57,11 @@ class _HomePageState extends State<HomePage> {
   String? _processId;
   SaveMode _saveMode = SaveMode.publicDownloads;
   String? _customSavePath;
-  final List<String> _log = [];
-  List<Map<String, dynamic>> _entries = [];
 
   @override
   void initState() {
     super.initState();
-    _reloadHistory();
     _loadSaveSettings();
-    _native.init().then((_) {
-      if (mounted) setState(() => _engineReady = true);
-    }).catchError((Object e) {
-      if (mounted) setState(() => _error = 'Engine init failed: $e');
-    });
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (files.isNotEmpty) {
         _urlCtrl.text = files.first.path;
@@ -82,11 +88,6 @@ class _HomePageState extends State<HomePage> {
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  Future<void> _reloadHistory() async {
-    _entries = await _history.list();
-    if (mounted) setState(() {});
   }
 
   Future<void> _loadSaveSettings() async {
@@ -125,9 +126,10 @@ class _HomePageState extends State<HomePage> {
       _fetching = true;
       _error = null;
       _meta = null;
+      _done = false;
     });
     try {
-      final meta = await _native
+      final meta = await widget.native
           .getInfo(raw)
           .timeout(const Duration(seconds: 45));
       setState(() => _meta = meta);
@@ -146,9 +148,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// Resolve the target output directory for the user's chosen save mode.
-  /// Public folder needs MANAGE_EXTERNAL_STORAGE ("Allow all files");
-  /// everything else falls back to the app-private dir if access isn't
-  /// granted or the custom path can't be used.
   Future<Directory> _outDir() async {
     switch (_saveMode) {
       case SaveMode.appPrivate:
@@ -280,8 +279,8 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  /// yt-dlp output titles come from YouTube metadata — cap the length
-  /// and strip separators/characters that break filenames.
+  /// yt-dlp output titles come from YouTube metadata — cap the length and
+  /// strip separators/characters that break filenames.
   String _safeTitle(String title) {
     var t = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     t = t.replaceAll(RegExp(r'[\x00-\x1F]'), ' ');
@@ -301,14 +300,69 @@ class _HomePageState extends State<HomePage> {
     return h > 0 ? '$h:${two(m)}:${two(sec)}' : '$m:${two(sec)}';
   }
 
+  /// yt-dlp reaches 100% before the ffmpeg merge/conversion step; while that
+  /// runs the UI shows an indeterminate bar instead of sticking at 100%.
+  bool get _reached100 => _progress != null && _progress! >= 0.999;
+
+  /// Warns when the same video was already downloaded in the same format.
+  /// Returns whether to continue.
+  Future<bool> _confirmDuplicate() async {
+    final raw = _urlCtrl.text.trim();
+    final ext = _format == OutFormat.mp3 ? 'mp3' : 'mp4';
+    Map<String, dynamic>? existing;
+    for (final e in widget.history.entries) {
+      if ((e['url'] ?? '').toString() == raw &&
+          (e['format'] ?? '').toString() == ext) {
+        existing = e;
+        break;
+      }
+    }
+    if (existing == null) return true;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Already downloaded'),
+        content: Text(
+          '"${existing!['title']}" is already in your history '
+          '(${existing['format']} — saved at ${existing['date']}).\n\n'
+          'Download it again?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'open'),
+            child: const Text('Open file'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, 'again'),
+            child: const Text('Download again'),
+          ),
+        ],
+      ),
+    );
+    switch (choice) {
+      case 'open':
+        OpenFilex.open((existing['path'] ?? '').toString());
+        return false;
+      case 'again':
+        return true;
+      default:
+        return false;
+    }
+  }
+
   Future<void> _download() async {
     final raw = _urlCtrl.text.trim();
     if (_meta == null) return;
+    if (!await _confirmDuplicate()) return;
     setState(() {
       _downloading = true;
       _cancelled = false;
+      _done = false;
       _progress = 0;
-      _log.clear();
       _error = null;
       _processId = DateTime.now().millisecondsSinceEpoch.toString();
     });
@@ -322,23 +376,23 @@ class _HomePageState extends State<HomePage> {
           : buildMp4Args(raw, _mp4H, outTpl);
       // Last element is the URL (passed separately to the native request).
       final options = fullArgs.sublist(0, fullArgs.length - 1);
-      await for (final p in _native.download(
+      await for (final p in widget.native.download(
         processId: _processId!,
         url: raw,
         options: options,
-        onLog: (String line) => _log.add(line),
       )) {
         setState(() => _progress = p);
       }
       final file = File('${dir.path}/$safeTitle.$ext');
-      await _history.add({
+      await widget.history.add({
         'title': _meta!.title,
         'path': file.path,
         'format': ext,
         'url': raw,
       });
-      await _reloadHistory();
+      await widget.notifier.downloadDone(_meta!.title);
       _snack('Saved to ${file.path}');
+      if (mounted) setState(() => _done = true);
     } catch (e) {
       if (!_cancelled) {
         setState(() => _error = '$e'.split('\n').first);
@@ -355,228 +409,167 @@ class _HomePageState extends State<HomePage> {
   Future<void> _cancel() async {
     setState(() => _cancelled = true);
     if (_processId != null) {
-      await _native.cancel(_processId!);
+      await widget.native.cancel(_processId!);
     }
-  }
-
-  Future<void> _clearHistory() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Clear download history?'),
-        content: const Text(
-          'This removes the list shown here. Downloaded files stay on disk — '
-          'delete them from your file manager if needed.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Clear'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    await _history.clear();
-    await _reloadHistory();
-    _snack('History cleared');
-  }
-
-  Future<void> _deleteEntry(Map<String, dynamic> e) async {
-    await _history.removeWhere((x) => x['path'] == e['path']);
-    await _reloadHistory();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: Image.asset(
-                'assets/logo.png',
-                height: 26,
-                width: 26,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) =>
-                    const Icon(Icons.video_library, size: 22),
-              ),
+    final theme = Theme.of(context);
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        TextField(
+          controller: _urlCtrl,
+          decoration: InputDecoration(
+            labelText: 'YouTube link',
+            hintText: 'https://youtu.be/...',
+            border: const OutlineInputBorder(),
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.paste),
+              onPressed: _paste,
             ),
-            const SizedBox(width: 10),
-            const Text('YTGet'),
-          ],
+          ),
+          keyboardType: TextInputType.url,
+          onSubmitted: (v) => _fetch(),
         ),
-        actions: [
-          if (!_engineReady)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ),
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const _SettingsPage()),
-            ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: (_fetching || !widget.engineReady) ? null : _fetch,
+          icon: const Icon(Icons.search),
+          label: Text(_fetching ? 'Fetching…' : 'Preview'),
+        ),
+        if (widget.engineError != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            widget.engineError!,
+            style: TextStyle(color: Colors.red.shade700),
           ),
         ],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          TextField(
-            controller: _urlCtrl,
-            decoration: InputDecoration(
-              labelText: 'YouTube link',
-              hintText: 'https://youtu.be/...',
-              border: const OutlineInputBorder(),
-              suffixIcon: IconButton(
-                icon: const Icon(Icons.paste),
-                onPressed: _paste,
-              ),
-            ),
-            keyboardType: TextInputType.url,
-          ),
+        if (_error != null) ...[
           const SizedBox(height: 12),
-          FilledButton.icon(
-            onPressed: (_fetching || !_engineReady) ? null : _fetch,
-            icon: const Icon(Icons.search),
-            label: Text(_fetching ? 'Fetching…' : 'Preview'),
-          ),
-          if (_error != null) ...[
-            const SizedBox(height: 12),
-            Text(_error!, style: TextStyle(color: Colors.red.shade700)),
-          ],
-          if (_meta != null) _previewCard(),
-          const SizedBox(height: 16),
-          _formatPicker(),
-          const SizedBox(height: 8),
-          Card(
-            margin: EdgeInsets.zero,
-            child: ListTile(
-              dense: true,
-              leading: const Icon(Icons.folder_open),
-              title: const Text('Save to'),
-              subtitle: Text(
-                _saveFolderSubtitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: const Icon(Icons.swap_horiz, size: 20),
-              onTap: _showSaveSheet,
+          Text(_error!, style: TextStyle(color: Colors.red.shade700)),
+        ],
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 250),
+          transitionBuilder: (child, anim) => FadeTransition(
+            opacity: anim,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.02),
+                end: Offset.zero,
+              ).animate(anim),
+              child: child,
             ),
           ),
-          const SizedBox(height: 16),
-          if (_progress != null)
-            Column(
+          child: _meta != null
+              ? Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  key: ValueKey('meta-${_meta!.title}'),
+                  child: _previewCard(),
+                )
+              : const SizedBox(height: 0, key: ValueKey('no-meta')),
+        ),
+        const SizedBox(height: 16),
+        _formatPicker(theme),
+        const SizedBox(height: 8),
+        Card(
+          margin: EdgeInsets.zero,
+          child: ListTile(
+            dense: true,
+            leading: const Icon(Icons.folder_open),
+            title: const Text('Save to'),
+            subtitle: Text(
+              _saveFolderSubtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: const Icon(Icons.swap_horiz, size: 20),
+            onTap: _showSaveSheet,
+          ),
+        ),
+        const SizedBox(height: 16),
+        if (_downloading)
+          TweenAnimationBuilder<double>(
+            tween: Tween(end: _progress),
+            duration: const Duration(milliseconds: 150),
+            builder: (context, v, _) => Column(
               children: [
-                LinearProgressIndicator(value: _progress),
-                Text('${((_progress ?? 0) * 100).toStringAsFixed(1)}%'),
-              ],
-            ),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: (_meta == null || _downloading || !_engineReady)
-                      ? null
-                      : _download,
-                  icon: const Icon(Icons.download),
-                  label: Text(_downloading ? 'Downloading…' : 'Download'),
+                LinearProgressIndicator(
+                  value: _reached100 ? null : v,
+                  minHeight: 6,
                 ),
-              ),
-              if (_downloading) ...[
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: _cancel,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Cancel'),
-                ),
-              ],
-            ],
-          ),
-          if (_log.isNotEmpty)
-            ExpansionTile(
-              title: const Text('Log'),
-              children: _log.reversed.take(30).map(
-                (l) => Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    l,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'monospace',
-                    ),
+                const SizedBox(height: 4),
+                Text(
+                  _reached100
+                      ? 'Processing… (merging / converting)'
+                      : '${(v * 100).toStringAsFixed(1)}%',
+                  style: TextStyle(
+                    color: _reached100 ? theme.hintColor : null,
                   ),
                 ),
-              ).toList(),
+              ],
             ),
-          const Divider(),
-          Padding(
-            padding: const EdgeInsets.only(top: 2, bottom: 4),
-            child: Row(
+          )
+        else if (_done)
+          TweenAnimationBuilder<double>(
+            tween: Tween(begin: 0, end: 1),
+            duration: const Duration(milliseconds: 400),
+            curve: Curves.easeOutCubic,
+            builder: (context, v, _) => Column(
               children: [
-                const Text(
-                  'History',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                LinearProgressIndicator(
+                  value: v,
+                  minHeight: 6,
+                  color: Colors.green,
+                  backgroundColor: Colors.green.withValues(alpha: 0.15),
                 ),
-                const Spacer(),
-                if (_entries.isNotEmpty)
-                  TextButton.icon(
-                    onPressed: _clearHistory,
-                    icon: const Icon(Icons.delete_sweep, size: 18),
-                    label: const Text('Clear'),
-                  ),
-              ],
-            ),
-          ),
-          ..._entries.map(
-            (e) => ListTile(
-              title: Text((e['title'] ?? '').toString()),
-              subtitle: Text(
-                (e['path'] ?? '').toString(),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.open_in_new),
-                    tooltip: 'Open',
-                    onPressed: () =>
-                        OpenFilex.open((e['path'] ?? '').toString()),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.share),
-                    tooltip: 'Share',
-                    onPressed: () => SharePlus.instance.share(
-                      ShareParams(
-                        files: [XFile((e['path'] ?? '').toString())],
+                const SizedBox(height: 4),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle, size: 16, color: Colors.green),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Downloaded',
+                      style: TextStyle(
+                        color: Colors.green.shade700,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.delete_outline),
-                    tooltip: 'Remove from history',
-                    onPressed: () => _deleteEntry(e),
-                  ),
-                ],
-              ),
+                  ],
+                ),
+              ],
             ),
           ),
-        ],
-      ),
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: (_meta == null || _downloading || !widget.engineReady)
+                    ? null
+                    : _download,
+                icon: Icon(
+                  _done && !_downloading ? Icons.check_circle : Icons.download,
+                ),
+                label: Text(
+                  _downloading
+                      ? (_reached100 ? 'Processing…' : 'Downloading…')
+                      : (_done ? 'Downloaded' : 'Download'),
+                ),
+              ),
+            ),
+            if (_downloading) ...[
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _cancel,
+                icon: const Icon(Icons.stop),
+                label: const Text('Cancel'),
+              ),
+            ],
+          ],
+        ),
+      ],
     );
   }
 
@@ -601,7 +594,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _formatPicker() {
+  Widget _formatPicker(ThemeData theme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -636,73 +629,6 @@ class _HomePageState extends State<HomePage> {
             onChanged: (v) => setState(() => _mp4H = v ?? 720),
           ),
       ],
-    );
-  }
-}
-
-class _SettingsPage extends StatefulWidget {
-  const _SettingsPage();
-  @override
-  State<_SettingsPage> createState() => _SettingsPageState();
-}
-
-class _SettingsPageState extends State<_SettingsPage> {
-  final _native = NativeYtDlp();
-  String _ver = '…';
-  bool _updating = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _native.version().then((v) {
-      if (mounted) setState(() => _ver = v);
-    }).catchError((Object e) {
-      if (mounted) setState(() => _ver = 'error: $e');
-    });
-  }
-
-  Future<void> _update() async {
-    setState(() => _updating = true);
-    try {
-      final s = await _native.update();
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Update: $s')));
-        setState(() => _ver = 'updated ($s) — reopen to refresh');
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Update failed: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _updating = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          ListTile(
-            title: const Text('yt-dlp version'),
-            subtitle: Text(_ver),
-            trailing: _updating
-                ? const CircularProgressIndicator()
-                : TextButton(onPressed: _update, child: const Text('Update')),
-          ),
-          const Text(
-            'Personal use only. Only download your own videos, Creative Commons, '
-            'or content you have permission for. YouTube ToS applies. '
-            'Sideload only — never for the Play Store.',
-          ),
-        ],
-      ),
     );
   }
 }

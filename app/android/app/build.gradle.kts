@@ -12,6 +12,8 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Required by flutter_local_notifications
+        isCoreLibraryDesugaringEnabled = true
     }
 
     defaultConfig {
@@ -67,4 +69,5 @@ flutter {
 dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }

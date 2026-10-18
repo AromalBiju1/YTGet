@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'ui/home_page.dart';
+import 'ui/app_shell.dart';
 
 void main() => runApp(const YTGetApp());
 
@@ -11,7 +11,7 @@ class YTGetApp extends StatelessWidget {
     return MaterialApp(
       title: 'YTGet',
       theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
-      home: const HomePage(),
+      home: const AppShell(),
     );
   }
 }
